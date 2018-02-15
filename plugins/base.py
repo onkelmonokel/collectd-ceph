@@ -103,6 +103,7 @@ class Base(object):
         else:
             val.type_instance=type
         val.values=[value]
+        val.host=self.cluster
         val.interval = self.interval
         val.dispatch()
         self.logdebug("sent metric %s.%s.%s.%s.%s"

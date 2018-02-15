@@ -45,7 +45,7 @@ class CephPoolPlugin(base.Base):
     def get_stats(self):
         """Retrieves stats from ceph pools"""
 
-        ceph_cluster = "%s-%s" % (self.prefix, self.cluster)
+        ceph_cluster = "cluster_utilization"
 
         data = { ceph_cluster: {} }
 
@@ -54,7 +54,9 @@ class CephPoolPlugin(base.Base):
             osd_pool_cmdline='ceph osd pool stats -f json --cluster ' + self.cluster
             stats_output = subprocess.check_output(osd_pool_cmdline, shell=True)
             cephdf_cmdline='ceph df -f json --cluster ' + self.cluster 
-            df_output = subprocess.check_output(ceph_dfcmdline, shell=True)
+            df_output = subprocess.check_output(cephdf_cmdline, shell=True)
+            pool_ls_cmdline='ceph osd pool ls -f json --cluster ' + self.cluster 
+            pool_ls_output = subprocess.check_output(pool_ls_cmdline, shell=True)
         except Exception as exc:
             collectd.error("ceph-pool: failed to ceph pool stats :: %s :: %s"
                     % (exc, traceback.format_exc()))
@@ -66,15 +68,39 @@ class CephPoolPlugin(base.Base):
         if df_output is None:
             collectd.error('ceph-pool: failed to ceph df :: output was None')
 
+        if pool_ls_output is None:
+            collectd.error('ceph-pool: failed to ceph osd pool ls :: output was None')
+
+
         json_stats_data = json.loads(stats_output)
         json_df_data = json.loads(df_output)
+
+        json_rbd_data = {}
+        try:
+            json_pool_ls = json.loads(pool_ls_output)
+            for pool in json_pool_ls:
+                rbd_cmdline='rbd ls -l ' + pool + ' --format json --cluster ' + self.cluster 
+                rbd_output = subprocess.check_output(rbd_cmdline, shell=True)
+                json_rbd_data[pool] = json.loads(rbd_output)
+        except Exception as exc:
+            collectd.error("ceph-pool: failed to rbd ls :: %s :: %s"
+                    % (exc, traceback.format_exc()))
+            return
+
+        # provisioned per pool (kB)
+        provision = {}
+        for pool_name, rbd_list in json_rbd_data.items():
+            provision[pool_name] = 0
+            for rbd in rbd_list:
+                provision[pool_name] = provision[pool_name] + rbd['size']
+
 
         # push osd pool stats results
         for pool in json_stats_data:
             pool_key = "pool-%s" % pool['pool_name']
             data[ceph_cluster][pool_key] = {}
             pool_data = data[ceph_cluster][pool_key] 
-            for stat in ('read_bytes_sec', 'write_bytes_sec', 'op_per_sec'):
+            for stat in ('read_bytes_sec', 'write_bytes_sec', 'read_op_per_sec', 'write_op_per_sec'):
                 pool_data[stat] = pool['client_io_rate'][stat] if pool['client_io_rate'].has_key(stat) else 0
 
         # push df results
@@ -90,11 +116,32 @@ class CephPoolPlugin(base.Base):
             data[ceph_cluster]['cluster']['total_space'] = int(json_df_data['stats']['total_bytes'])
             data[ceph_cluster]['cluster']['total_used'] = int(json_df_data['stats']['total_used_bytes'])
             data[ceph_cluster]['cluster']['total_avail'] = int(json_df_data['stats']['total_avail_bytes'])
+            data[ceph_cluster]['cluster']['percent_used'] = (
+                                                                int(
+                                                                    json_df_data['stats']['total_used_bytes']
+                                                                ) * 100 / (
+                                                                    int(json_df_data['stats']['total_bytes'])
+                                                                    * 1.0
+                                                                )
+                                                            )
         else:
             # ceph < 0.84
             data[ceph_cluster]['cluster']['total_space'] = int(json_df_data['stats']['total_space']) * 1024.0
             data[ceph_cluster]['cluster']['total_used'] = int(json_df_data['stats']['total_used']) * 1024.0
             data[ceph_cluster]['cluster']['total_avail'] = int(json_df_data['stats']['total_avail']) * 1024.0
+            data[ceph_cluster]['cluster']['percent_used'] = (
+                                                                int(
+                                                                    json_df_data['stats']['total_used_bytes']
+                                                                ) * 100 / (
+                                                                    int(json_df_data['stats']['total_bytes'])
+                                                                    * 1.0
+                                                                )
+                                                            )
+
+        # push provisioned per pools
+        for pool_name, pool_provision in provision.items():
+            if pool_provision:
+                data[ceph_cluster]["pool-%s" % pool_name]['kb_provisioned'] = pool_provision
 
         return data
 
